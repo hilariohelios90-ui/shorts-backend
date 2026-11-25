@@ -61,16 +61,34 @@ def get_transcript(video_id):
 def download_youtube(url, dest):
     """yt-dlp en el SERVIDOR (no en el navegador).
     En producción usa cookies.txt de una cuenta con sesión
-    (ver README) porque YouTube bloquea IPs de centros de datos."""
+    (ver README) porque YouTube bloquea IPs de centros de datos.
+    Formato robusto: mejor video+audio y mezcla a MP4 (el '-f mp4'
+    simple falla en muchos videos porque no hay un único mp4).
+    Prueba primero el cliente web y luego el cliente Android,
+    que a veces pasa el bloqueo de bots; el error incluye la
+    salida real de yt-dlp para poder diagnosticarlo."""
     import shutil, sys
     ytdlp = shutil.which("yt-dlp") or str(Path(sys.executable).parent / "yt-dlp")
-    cmd = [ytdlp, "--no-check-certificate", "-f", "mp4",
-           "-o", str(dest), url]
     cookies = BASE / "cookies.txt"
+    base = [ytdlp, "--no-check-certificate", "--no-playlist",
+            "--retries", "3", "--fragment-retries", "3",
+            "-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
+            "--merge-output-format", "mp4",
+            "-o", str(dest)]
     if cookies.exists():
-        cmd = [ytdlp, "--no-check-certificate", "--cookies", str(cookies),
-               "-f", "mp4", "-o", str(dest), url]
-    subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=900)
+        base += ["--cookies", str(cookies)]
+    attempts = [
+        base + [url],
+        base + ["--extractor-args", "youtube:player_client=android", url],
+        base + ["--extractor-args", "youtube:player_client=ios", url],
+    ]
+    last_err = ""
+    for cmd in attempts:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        if r.returncode == 0 and Path(dest).exists():
+            return
+        last_err = (r.stderr or r.stdout or "").strip()[-600:]
+    raise RuntimeError(f"yt-dlp no pudo descargar el video. Último error: {last_err}")
 
 
 def run_job(job_id, video_path, transcript, meta):
