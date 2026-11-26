@@ -7,8 +7,9 @@ GET  /                  -> mini formulario de prueba
 
 Flujo real (sin simulación):
   1. Entrada: video subido, o link de YouTube descargado con yt-dlp.
-  2. Transcripción: subtítulos de YouTube (youtube-transcript-api);
-     si no hay, Whisper (opcional, ver README).
+  2. Transcripción: subtítulos de YouTube (youtube-transcript-api)
+     o transcript.json si se sube; si no hay, Whisper transcribe
+     el audio del video (faster-whisper, modelo tiny int8).
   3. Cortes: process.choose_cuts() — tramos de 30-60 s con gancho.
   4. FFmpeg: corte vertical 1080x1920, subtítulos quemados,
      audio original AAC, SFX mezclados si están en sfx/.
@@ -58,6 +59,45 @@ def get_transcript(video_id):
             for s in t.snippets]
 
 
+_WHISPER_MODEL = None
+
+
+def transcribe_whisper(video_path):
+    """Transcribe el audio del video con Whisper (faster-whisper).
+
+    Respaldo cuando no hay subtítulos de YouTube ni transcript.json:
+    la ruta de subida funciona sola y la ruta de YouTube ya no
+    depende de que youtube-transcript-api pase el bloqueo de IP.
+    Modelo 'tiny' int8 por defecto (WHISPER_MODEL para cambiarlo):
+    es el que cabe cómodo en el plan Free de Render; el modelo se
+    descarga la primera vez (~75 MB) y queda en memoria del proceso.
+    Devuelve [] si no se detecta voz, sin inventar texto."""
+    global _WHISPER_MODEL
+    from faster_whisper import WhisperModel
+    if _WHISPER_MODEL is None:
+        size = os.environ.get("WHISPER_MODEL", "tiny")
+        _WHISPER_MODEL = WhisperModel(size, device="cpu", compute_type="int8")
+    # Decodificar con FFmpeg a PCM 16 kHz mono y pasar el arreglo:
+    # evita depender de PyAV (su API cambió entre versiones).
+    import numpy as np
+    r = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(video_path), "-vn",
+         "-ac", "1", "-ar", "16000", "-f", "f32le", "-"],
+        capture_output=True, timeout=600)
+    if r.returncode != 0 or not r.stdout:
+        raise RuntimeError("FFmpeg no pudo extraer el audio del video.")
+    audio = np.frombuffer(r.stdout, dtype=np.float32)
+    segments, _info = _WHISPER_MODEL.transcribe(
+        audio, vad_filter=True, beam_size=1)
+    out = []
+    for s in segments:
+        text = (s.text or "").strip()
+        if text:
+            out.append({"text": text, "start": float(s.start),
+                        "duration": max(0.1, float(s.end) - float(s.start))})
+    return out
+
+
 def download_youtube(url, dest):
     """yt-dlp en el SERVIDOR (no en el navegador).
     En producción usa cookies.txt de una cuenta con sesión
@@ -69,7 +109,14 @@ def download_youtube(url, dest):
     salida real de yt-dlp para poder diagnosticarlo."""
     import shutil, sys
     ytdlp = shutil.which("yt-dlp") or str(Path(sys.executable).parent / "yt-dlp")
+    # cookies.txt puede estar junto a app.py (desarrollo) o en
+    # /etc/secrets/cookies.txt (archivo secreto de Render, que es
+    # donde debe ir en producción: NUNCA en el repo público de GitHub).
     cookies = BASE / "cookies.txt"
+    if not cookies.exists():
+        alt = Path("/etc/secrets/cookies.txt")
+        if alt.exists():
+            cookies = alt
     base = [ytdlp, "--no-check-certificate", "--no-playlist",
             "--retries", "3", "--fragment-retries", "3",
             "-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
@@ -128,9 +175,8 @@ async def create_job(youtube_url: str = Form(None), n_shorts: int = Form(3),
         with open(video_path, "wb") as f:
             shutil.copyfileobj(file.file, f)
         JOBS[job_id]["meta"] = {"source": "upload", "filename": file.filename}
-        # Sin transcripción aún: en producción aquí va Whisper.
-        # Para la prueba, la transcripción se pasa como archivo
-        # transcript.json junto al video (ver README).
+        # Transcripción: transcript.json si viene; si no, Whisper
+        # transcribe el audio del propio video (sin inventar texto).
         transcript = []
         if transcript_file is not None:
             tj = jobdir / "transcript.json"
@@ -139,12 +185,23 @@ async def create_job(youtube_url: str = Form(None), n_shorts: int = Form(3),
             transcript = json.loads(tj.read_text())
         elif (jobdir / "transcript.json").exists():
             transcript = json.loads((jobdir / "transcript.json").read_text())
-        if not transcript:
-            JOBS[job_id].update(status="error", step="Error",
-                error="Video subido, pero sin transcripción. Sube también transcript.json "
-                      "o activa Whisper (ver README). No se inventó ningún corte.")
+        if transcript:
+            threading.Thread(target=run_job, args=(job_id, video_path, transcript, {"n_shorts": n_shorts}), daemon=True).start()
             return JOBS[job_id]
-        threading.Thread(target=run_job, args=(job_id, video_path, transcript, {"n_shorts": n_shorts}), daemon=True).start()
+        def _upload():
+            try:
+                set_status(job_id, status="processing", progress=20,
+                           step="Transcribiendo audio con Whisper")
+                t = transcribe_whisper(video_path)
+                if not t:
+                    raise RuntimeError(
+                        "No se detectó voz en el video subido, así que no hay "
+                        "transcripción para armar cortes. Sube un video con voz "
+                        "o adjunta transcript.json. No se inventó ningún corte.")
+                run_job(job_id, video_path, t, {"n_shorts": n_shorts})
+            except Exception as e:
+                set_status(job_id, status="error", step="Error", error=str(e)[:800])
+        threading.Thread(target=_upload, daemon=True).start()
         return JOBS[job_id]
 
     if youtube_url:
@@ -162,7 +219,20 @@ async def create_job(youtube_url: str = Form(None), n_shorts: int = Form(3),
                 video_path = jobdir / "input.mp4"
                 download_youtube(youtube_url, video_path)
                 set_status(job_id, progress=30, step="Obteniendo transcripción")
-                transcript = get_transcript(vid)
+                try:
+                    transcript = get_transcript(vid)
+                except Exception:
+                    transcript = []
+                if not transcript:
+                    # Sin subtítulos (o API bloqueada): Whisper sobre
+                    # el audio ya descargado, sin inventar texto.
+                    set_status(job_id, progress=35,
+                               step="Transcribiendo audio con Whisper")
+                    transcript = transcribe_whisper(video_path)
+                if not transcript:
+                    raise RuntimeError(
+                        "El video no tiene subtítulos y no se detectó voz "
+                        "para transcribir. No se inventó ningún corte.")
                 run_job(job_id, video_path, transcript, {"n_shorts": n_shorts})
             except Exception as e:
                 set_status(job_id, status="error", step="Error", error=str(e)[:800])

@@ -4,3 +4,4 @@ yt-dlp
 youtube-transcript-api
 requests
 python-multipart
+faster-whisper
