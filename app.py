@@ -75,6 +75,36 @@ def cookies_path():
     return alt if alt.exists() else p
 
 
+def parse_netscape_cookies(path):
+    """Lee cookies Netscape (incluye líneas #HttpOnly_) sin
+    exponer valores: devuelve lista de (dominio, nombre, valor)
+    solo para armar la sesión HTTP interna."""
+    out = []
+    try:
+        for line in Path(path).read_text(errors="ignore").splitlines():
+            line = line.strip()
+            if line.startswith("#HttpOnly_"):
+                line = line[len("#HttpOnly_"):]
+            elif not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 7:
+                out.append((parts[0], parts[5], parts[6]))
+    except Exception:
+        return []
+    return out
+
+
+def cookies_status():
+    """Estado del archivo de cookies sin mostrar valores."""
+    p = cookies_path()
+    info = {"exists": p.exists(), "path": str(p)}
+    if p.exists():
+        info["size_bytes"] = p.stat().st_size
+        info["cookie_lines"] = len(parse_netscape_cookies(p))
+    return info
+
+
 def get_transcript(video_id):
     """Baja subtítulos/transcripción sin bajar el video.
     Si existe cookies.txt, lo usa también para esta petición:
@@ -85,11 +115,9 @@ def get_transcript(video_id):
     cookies = cookies_path()
     if cookies.exists():
         try:
-            from http.cookiejar import MozillaCookieJar
-            jar = MozillaCookieJar(str(cookies))
-            jar.load(ignore_discard=True, ignore_expires=True)
             session = requests.Session()
-            session.cookies = jar
+            for domain, name, value in parse_netscape_cookies(cookies):
+                session.cookies.set(name, value, domain=domain)
         except Exception:
             session = None
     api = YouTubeTranscriptApi(http_client=session) if session else YouTubeTranscriptApi()
@@ -210,33 +238,35 @@ def _ytdlp_base(dest, audio_only=False, section=None):
 
 
 def _run_ytdlp(url, dest, audio_only=False, section=None):
-    """Corre yt-dlp con los intentos conocidos. El error incluye
-    la salida real de yt-dlp. No descarga todo el video cuando
-    section viene definido: solo el tramo pedido."""
+    """Corre yt-dlp con los intentos conocidos. Si hay cookies,
+    van PRIMERO (son la vía pensada para pasar el bloqueo de
+    IP); el error final resume cada intento sin valores de
+    cookies. No descarga todo el video cuando section viene
+    definido: solo el tramo pedido."""
     base = _ytdlp_base(dest, audio_only=audio_only, section=section)
-    attempts = [base + ["--extractor-args", "youtube:player_client=tv", url]]
+    attempts = []
     cookies = cookies_path()
     if cookies.exists():
-        attempts.append(base + ["--cookies", str(cookies), url])
+        attempts.append(("web+cookies", base + ["--cookies", str(cookies), url]))
     attempts += [
-        base + ["--extractor-args", "youtube:player_client=android", url],
-        base + ["--extractor-args", "youtube:player_client=ios", url],
+        ("tv", base + ["--extractor-args", "youtube:player_client=tv", url]),
+        ("android", base + ["--extractor-args", "youtube:player_client=android", url]),
+        ("ios", base + ["--extractor-args", "youtube:player_client=ios", url]),
     ]
-    last_err = ""
-    for cmd in attempts:
+    summaries = []
+    for label, cmd in attempts:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
         found = Path(dest)
         if r.returncode == 0 and found.exists():
             return found
-        # Con plantillas %(ext)s o secciones, el archivo final
-        # puede variar de extensión: buscar por el mismo tallo.
-        if r.returncode == 0:
-            stem = str(found).replace("%(ext)s", "*")
-            matches = sorted(found.parent.glob(Path(stem).name)) if "%(ext)s" in str(dest) else []
+        if r.returncode == 0 and "%(ext)s" in str(dest):
+            matches = sorted(found.parent.glob(Path(str(found).replace("%(ext)s", "*")).name))
             if matches:
                 return matches[0]
-        last_err = (r.stderr or r.stdout or "").strip()[-600:]
-    raise RuntimeError(f"yt-dlp no pudo descargar el video. Último error: {last_err}")
+        err = (r.stderr or r.stdout or "").strip()
+        last = err.splitlines()[-1][:160] if err else "sin salida"
+        summaries.append(f"{label}: {last}")
+    raise RuntimeError("yt-dlp no pudo descargar el video. Intentos: " + " | ".join(summaries))
 
 
 def download_youtube_section(url, start, end, dest):
@@ -399,6 +429,11 @@ async def create_job(youtube_url: str = Form(None), n_shorts: int = Form(3),
     JOBS[job_id].update(status="error", step="Error",
                         error="Pasa un link de YouTube o sube un video.")
     return JOBS[job_id]
+
+
+@app.get("/api/debug/cookies")
+def debug_cookies():
+    return cookies_status()
 
 
 @app.get("/api/jobs/{job_id}")
