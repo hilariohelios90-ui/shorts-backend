@@ -37,7 +37,18 @@ JOBS = {}
 
 
 def set_status(job_id, **kw):
-    JOBS[job_id].update(kw)
+    job = JOBS.setdefault(job_id, {"id": job_id})
+    job.update(kw)
+    # Persistir en disco: si la instancia se reinicia (p. ej. por
+    # memoria), el sondeo devuelve el último estado real en vez
+    # de "Trabajo no encontrado".
+    try:
+        d = WORK / job_id
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "job.json").write_text(json.dumps(job, ensure_ascii=False),
+                                     encoding="utf-8")
+    except Exception:
+        pass
 
 
 def get_oembed(video_id):
@@ -78,9 +89,17 @@ def transcribe_whisper(video_path):
         size = os.environ.get("WHISPER_MODEL", "tiny")
         # cpu_threads=1: menos memoria pico en el plan Free (512 MB),
         # donde la prueba del 2026-11-26 se cayó por memoria.
-        _WHISPER_MODEL = WhisperModel(size, device="cpu",
-                                      compute_type="int8", cpu_threads=1,
-                                      num_workers=1)
+        # local_files_only: el modelo va horneado en la imagen Docker;
+        # descargarlo en caliente tras cada reinicio también suma
+        # memoria pico. Si no está en local, se descarga como antes.
+        try:
+            _WHISPER_MODEL = WhisperModel(size, device="cpu",
+                                          compute_type="int8", cpu_threads=1,
+                                          num_workers=1, local_files_only=True)
+        except Exception:
+            _WHISPER_MODEL = WhisperModel(size, device="cpu",
+                                          compute_type="int8", cpu_threads=1,
+                                          num_workers=1)
     # Decodificar con FFmpeg a PCM 16 kHz mono y pasar el arreglo:
     # evita depender de PyAV (su API cambió entre versiones).
     import numpy as np
@@ -277,7 +296,21 @@ async def create_job(youtube_url: str = Form(None), n_shorts: int = Form(3),
 
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str):
-    return JOBS.get(job_id, {"status": "error", "error": "Trabajo no encontrado"})
+    if job_id in JOBS:
+        return JOBS[job_id]
+    f = WORK / job_id / "job.json"
+    if f.exists():
+        try:
+            job = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            job = {}
+        if job.get("status") in ("queued", "processing"):
+            return {**job, "status": "error", "step": "Error",
+                    "error": "El servidor se reinició durante el trabajo "
+                             "(posible falta de memoria). Inténtalo de nuevo."}
+        if job:
+            return job
+    return {"status": "error", "error": "Trabajo no encontrado"}
 
 
 @app.get("/files/{job_id}/{name}")
