@@ -1,7 +1,8 @@
 fastapi
 uvicorn[standard]
-yt-dlp
+yt-dlp[default]
 youtube-transcript-api
 requests
 python-multipart
 faster-whisper
+bgutil-ytdlp-pot-provider==2.0.2

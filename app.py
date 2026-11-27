@@ -100,13 +100,20 @@ def transcribe_whisper(video_path):
 
 def download_youtube(url, dest):
     """yt-dlp en el SERVIDOR (no en el navegador).
-    En producción usa cookies.txt de una cuenta con sesión
-    (ver README) porque YouTube bloquea IPs de centros de datos.
-    Formato robusto: mejor video+audio y mezcla a MP4 (el '-f mp4'
-    simple falla en muchos videos porque no hay un único mp4).
-    Prueba primero el cliente web y luego el cliente Android,
-    que a veces pasa el bloqueo de bots; el error incluye la
-    salida real de yt-dlp para poder diagnosticarlo."""
+    YouTube bloquea IPs de centros de datos (Render) con
+    "Sign in to confirm you're not a bot". Orden de intentos:
+      1. mweb + PO token (bgutil, servidor local en :4416 si está
+         corriendo): no usa ninguna cuenta de Google.
+      2. tv: a veces pasa el bloqueo sin token ni cookies.
+      3. web con cookies.txt si existe (cuenta desechable,
+         exportadas desde ventana privada cerrada al terminar;
+         ver README — las cookies de una pestaña abierta rotan
+         y dejan de servir en horas).
+      4. android / ios como último recurso.
+    Además pasa --js-runtimes cuando hay deno/node: yt-dlp
+    2026 deprecó la extracción sin runtime JS (retos n/sig)
+    y sin él faltan formatos aunque no haya bloqueo.
+    El error incluye la salida real de yt-dlp."""
     import shutil, sys
     ytdlp = shutil.which("yt-dlp") or str(Path(sys.executable).parent / "yt-dlp")
     # cookies.txt puede estar junto a app.py (desarrollo) o en
@@ -122,10 +129,19 @@ def download_youtube(url, dest):
             "-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
             "--merge-output-format", "mp4",
             "-o", str(dest)]
-    if cookies.exists():
-        base += ["--cookies", str(cookies)]
+    for runtime in ("deno", "node"):
+        if shutil.which(runtime):
+            base += ["--js-runtimes", runtime]
+            break
     attempts = [
-        base + [url],
+        base + ["--extractor-args", "youtube:player_client=mweb",
+                "--extractor-args",
+                "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416", url],
+        base + ["--extractor-args", "youtube:player_client=tv", url],
+    ]
+    if cookies.exists():
+        attempts.append(base + ["--cookies", str(cookies), url])
+    attempts += [
         base + ["--extractor-args", "youtube:player_client=android", url],
         base + ["--extractor-args", "youtube:player_client=ios", url],
     ]
