@@ -267,7 +267,12 @@ def _run_ytdlp(url, dest, audio_only=False, section=None):
     attempts = []
     cookies = cookies_runtime_path()
     if cookies.exists():
-        attempts.append(("web+cookies", base + ["--cookies", str(cookies), url]))
+        # Con cookies, probar varios clientes: el cliente web
+        # devolvió "No video formats found" en la prueba del
+        # 2026-11-27; otros clientes pueden entregar formatos.
+        for client in ("mweb", "tv", "android", "ios", "web"):
+            attempts.append((f"{client}+cookies", base + ["--cookies", str(cookies),
+                             "--extractor-args", f"youtube:player_client={client}", url]))
     attempts += [
         ("tv", base + ["--extractor-args", "youtube:player_client=tv", url]),
         ("android", base + ["--extractor-args", "youtube:player_client=android", url]),
@@ -321,7 +326,11 @@ def run_youtube_job(job_id, youtube_url, video_id, n_shorts):
         # queda visible y no se inventa ningún corte.
         set_status(job_id, progress=20,
                    step="Sin subtítulos: descargando solo el audio")
-        audio_path = download_youtube_audio(youtube_url, jobdir / "audio.%(ext)s")
+        try:
+            audio_path = download_youtube_audio(youtube_url, jobdir / "audio.%(ext)s")
+        except Exception as e:
+            raise RuntimeError(
+                f"{e} | Error de transcripción previo: {transcript_error[:200]}")
         set_status(job_id, progress=30,
                    step="Transcribiendo audio con Whisper")
         transcript = transcribe_whisper(audio_path)
