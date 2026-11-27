@@ -75,6 +75,26 @@ def cookies_path():
     return alt if alt.exists() else p
 
 
+def cookies_runtime_path():
+    """Copia escribible de las cookies para yt-dlp.
+
+    El secreto de Render vive en /etc/secrets/cookies.txt, que
+    es de solo lectura; yt-dlp intenta reescribir el archivo
+    de cookies al terminar y muere con Errno 30 (visto en la
+    prueba del 2026-11-27). Por eso yt-dlp recibe una copia
+    en WORK, nunca el secreto directo."""
+    src = cookies_path()
+    if not src.exists():
+        return src
+    dst = WORK / "cookies_runtime.txt"
+    try:
+        shutil.copyfile(src, dst)
+        dst.chmod(0o600)
+        return dst
+    except Exception:
+        return src
+
+
 def parse_netscape_cookies(path):
     """Lee cookies Netscape (incluye líneas #HttpOnly_) sin
     exponer valores: devuelve lista de (dominio, nombre, valor)
@@ -245,7 +265,7 @@ def _run_ytdlp(url, dest, audio_only=False, section=None):
     definido: solo el tramo pedido."""
     base = _ytdlp_base(dest, audio_only=audio_only, section=section)
     attempts = []
-    cookies = cookies_path()
+    cookies = cookies_runtime_path()
     if cookies.exists():
         attempts.append(("web+cookies", base + ["--cookies", str(cookies), url]))
     attempts += [
