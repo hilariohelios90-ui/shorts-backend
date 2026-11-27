@@ -26,7 +26,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # caliente tras cada reinicio suma memoria pico en el plan
 # Free (512 MB), donde la prueba del 2026-11-26 se cayó por OOM.
 ENV HF_HOME=/code/.hf_cache HF_HUB_DISABLE_XET=1 \
-    OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+    OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+    MALLOC_ARENA_MAX=2
 RUN python -c "from faster_whisper import WhisperModel; WhisperModel('tiny', device='cpu', compute_type='int8')"
 ENV HF_HUB_OFFLINE=1
 COPY app.py process.py start.sh ./

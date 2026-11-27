@@ -110,8 +110,10 @@ def transcribe_whisper(video_path):
     if r.returncode != 0 or not r.stdout:
         raise RuntimeError("FFmpeg no pudo extraer el audio del video.")
     audio = np.frombuffer(r.stdout, dtype=np.float32)
+    # vad_filter=False: el VAD (onnxruntime) suma ~50 MB de pico
+    # medidos localmente; en 512 MB ese margen decide el OOM.
     segments, _info = _WHISPER_MODEL.transcribe(
-        audio, vad_filter=True, beam_size=1)
+        audio, vad_filter=False, beam_size=1)
     out = []
     for s in segments:
         text = (s.text or "").strip()
