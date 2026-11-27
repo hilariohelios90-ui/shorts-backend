@@ -465,6 +465,43 @@ def debug_cookies():
     return cookies_status()
 
 
+@app.get("/api/debug/formats")
+def debug_formats(video_id: str = "jNQXAC9IVRw"):
+    """Diagnóstico yt-dlp: lista formatos con cookies y devuelve
+    solo avisos/errores y conteo (nunca valores de cookies)."""
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    cookies = cookies_runtime_path()
+    base = _ytdlp_base("/tmp/debug.%(ext)s")
+    # Quitar -o y formato de descarga: aquí solo se lista.
+    cmd = []
+    skip_next = False
+    for i, tok in enumerate(base):
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in ("-o", "-f"):
+            skip_next = True
+            continue
+        if tok == "--merge-output-format":
+            skip_next = True
+            continue
+        cmd.append(tok)
+    if cookies.exists():
+        cmd += ["--cookies", str(cookies)]
+    cmd += ["--extractor-args", "youtube:player_client=mweb", "-F", url]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    lines = []
+    for line in (r.stderr + "\n" + r.stdout).splitlines():
+        low = line.lower()
+        if any(k in low for k in ("warning", "error", "po token", "challenge",
+                                  "javascript", "runtime", "sign in", "bot",
+                                  "formats", "available")):
+            lines.append(line[:220])
+    fmt_lines = [l for l in r.stdout.splitlines() if l[:3].strip().isdigit()]
+    return {"returncode": r.returncode, "format_lines": len(fmt_lines),
+            "diagnostics": lines[:25]}
+
+
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str):
     if job_id in JOBS:
