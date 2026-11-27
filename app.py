@@ -76,7 +76,11 @@ def transcribe_whisper(video_path):
     from faster_whisper import WhisperModel
     if _WHISPER_MODEL is None:
         size = os.environ.get("WHISPER_MODEL", "tiny")
-        _WHISPER_MODEL = WhisperModel(size, device="cpu", compute_type="int8")
+        # cpu_threads=1: menos memoria pico en el plan Free (512 MB),
+        # donde la prueba del 2026-11-26 se cayó por memoria.
+        _WHISPER_MODEL = WhisperModel(size, device="cpu",
+                                      compute_type="int8", cpu_threads=1,
+                                      num_workers=1)
     # Decodificar con FFmpeg a PCM 16 kHz mono y pasar el arreglo:
     # evita depender de PyAV (su API cambió entre versiones).
     import numpy as np
@@ -95,6 +99,12 @@ def transcribe_whisper(video_path):
         if text:
             out.append({"text": text, "start": float(s.start),
                         "duration": max(0.1, float(s.end) - float(s.start))})
+    # Liberar el modelo antes de cortar con FFmpeg: en 512 MB no
+    # pueden convivir Whisper y el corte sin riesgo de OOM.
+    del segments, audio
+    _WHISPER_MODEL = None
+    import gc
+    gc.collect()
     return out
 
 
@@ -102,14 +112,15 @@ def download_youtube(url, dest):
     """yt-dlp en el SERVIDOR (no en el navegador).
     YouTube bloquea IPs de centros de datos (Render) con
     "Sign in to confirm you're not a bot". Orden de intentos:
-      1. mweb + PO token (bgutil, servidor local en :4416 si está
-         corriendo): no usa ninguna cuenta de Google.
-      2. tv: a veces pasa el bloqueo sin token ni cookies.
-      3. web con cookies.txt si existe (cuenta desechable,
+      1. tv: a veces pasa el bloqueo sin cookies.
+      2. web con cookies.txt si existe (cuenta desechable,
          exportadas desde ventana privada cerrada al terminar;
          ver README — las cookies de una pestaña abierta rotan
          y dejan de servir en horas).
-      4. android / ios como último recurso.
+      3. android / ios como último recurso.
+    (El intento mweb + PO token bgutil se quitó el 2026-11-26:
+    el token recibió 429 y el servidor extra contribuyó al
+    corte por memoria en el plan Free de 512 MB.)
     Además pasa --js-runtimes cuando hay deno/node: yt-dlp
     2026 deprecó la extracción sin runtime JS (retos n/sig)
     y sin él faltan formatos aunque no haya bloqueo.
@@ -129,14 +140,18 @@ def download_youtube(url, dest):
             "-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
             "--merge-output-format", "mp4",
             "-o", str(dest)]
-    for runtime in ("deno", "node"):
-        if shutil.which(runtime):
-            base += ["--js-runtimes", runtime]
+    # Runtime JS con ruta explícita: en la prueba del 2026-11-26
+    # yt-dlp no detectó Deno solo por el PATH.
+    for cand in ("/usr/local/bin/deno", "/root/.deno/bin/deno"):
+        if Path(cand).exists():
+            base += ["--js-runtimes", f"deno:{cand}"]
             break
+    else:
+        for runtime in ("deno", "node"):
+            if shutil.which(runtime):
+                base += ["--js-runtimes", runtime]
+                break
     attempts = [
-        base + ["--extractor-args", "youtube:player_client=mweb",
-                "--extractor-args",
-                "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416", url],
         base + ["--extractor-args", "youtube:player_client=tv", url],
     ]
     if cookies.exists():
